@@ -5,18 +5,13 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"slices"
-	"strconv"
 	"strings"
 
-	"github.com/docker/go-units"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"github.com/sirupsen/logrus"
@@ -24,7 +19,6 @@ import (
 
 	"github.com/lima-vm/lima/v2/pkg/gendoc"
 	"github.com/lima-vm/lima/v2/pkg/limactlutil"
-	"github.com/lima-vm/lima/v2/pkg/limatype"
 	"github.com/lima-vm/lima/v2/pkg/version"
 )
 
@@ -42,18 +36,33 @@ var (
 )
 
 type State struct {
-	insts   []*limatype.Instance
-	limactl string
-	ctx     context.Context
-	app     *tview.Application
-	list    *tview.List
-	header  *tview.TextView
-	panel   *tview.Flex
-	flex    *tview.Flex
+	limactl    string
+	ctx        context.Context
+	app        *tview.Application
+	list       *tview.List
+	header     *tview.TextView
+	panel      *tview.Flex
+	footer     *tview.TextView
+	flex       *tview.Flex
+	menuBar    *tview.TextView
+	openedMenu int
 	// status is the status line shown above the footer until a key is pressed.
 	status *tview.TextView
 	// createView is the root of the create form, restored after an error message.
 	createView *tview.Flex
+
+	// views are the views of the menu, in the order of the View menu
+	views []view
+	// cur is the index of the current view in views
+	cur int
+	// selected is the key of the selected row of each view, restored when switching back to the view
+	selected []string
+	// rowCount is the number of rows of the current view shown in the list
+	rowCount int
+	// loadErr is the error of the last load of the current view
+	loadErr error
+	// instances is the view of the instances, also used by the create form
+	instances *instancesView
 }
 
 func main() {
@@ -70,7 +79,7 @@ func newApp() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE:          runMenu,
-		// The hidden generate-doc command must not add a completion command.
+		// The hidden generate-doc command must not add a completion command
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 		Annotations: map[string]string{
 			// Show "limactl menu" rather than "limactl-menu" in the usage and in the docs
@@ -109,38 +118,25 @@ func runMenu(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	ctx := cmd.Context()
-	insts, err := listInstances(ctx, limactl)
-	if err != nil {
-		return err
-	}
-	s := &State{insts: insts, limactl: limactl, ctx: ctx}
+	s := &State{limactl: limactl, ctx: cmd.Context()}
+	s.instances = newInstancesView(s)
+	s.setViews(s.instances, newDisksView(s), newNetworksView(s))
 	return s.run()
+}
+
+// setViews sets the views of the menu, in the order of the View menu.
+func (s *State) setViews(views ...view) {
+	s.views = views
+	s.selected = make([]string, len(views))
+	s.cur = 0
 }
 
 func (s *State) run() error {
 	s.app = tview.NewApplication().EnableMouse(true)
 	s.setupStyles()
 	s.buildUI()
-
-	footer := tview.NewTextView().
-		SetDynamicColors(true).
-		SetText(" [::r]F1[::-] Help  [::r]F2[::-] Start/Stop  [::r]F3[::-] Info  [::r]F5[::-] Refresh  [::r]F7[::-] Create  [::r]F8[::-] Delete  [::r]F10[::-] Quit")
-
-	s.status = tview.NewTextView().
-		SetDynamicColors(true).
-		SetText(" Press [::b]F1[::-], [::b]?[::-], or [::b]h[::-] to show the usage")
-
-	s.flex = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(s.panel, 0, 1, true).
-		AddItem(s.status, 1, 1, false).
-		AddItem(footer, 1, 1, false)
-
+	s.loadView()
 	s.app.SetRoot(s.flex, true).SetFocus(s.list)
-	s.app.SetInputCapture(s.handleGlobalKey)
-	if len(s.insts) == 0 {
-		s.showEmptyState()
-	}
 	return s.app.Run()
 }
 
@@ -154,6 +150,7 @@ func (s *State) setupStyles() {
 	tview.Styles.ContrastSecondaryTextColor = cTxt
 }
 
+// buildUI builds the widgets of the main screen. s.app must be set.
 func (s *State) buildUI() {
 	s.list = tview.NewList().
 		SetHighlightFullLine(true).
@@ -168,82 +165,111 @@ func (s *State) buildUI() {
 		AddItem(s.list, 0, 1, true)
 	s.panel.SetBorder(true).
 		SetBorderColor(cBord).
-		SetTitle(" Lima Instances ").
 		SetTitleAlign(tview.AlignLeft).
 		SetTitleColor(cPrim).
 		SetBorderPadding(1, 1, 1, 1)
 
+	s.footer = tview.NewTextView().SetDynamicColors(true)
+
+	s.status = tview.NewTextView().
+		SetDynamicColors(true).
+		SetText(" Press [::b]F9[::-] to open the menu bar, or [::b]F1[::-] to show the usage")
+
+	s.openedMenu = -1
+	s.menuBar = s.newMenuBar()
+
+	s.flex = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(s.menuBar, 1, 0, false).
+		AddItem(s.panel, 0, 1, true).
+		AddItem(s.status, 1, 1, false).
+		AddItem(s.footer, 1, 1, false)
+
+	s.app.SetInputCapture(s.handleGlobalKey)
+}
+
+func (s *State) currentView() view {
+	return s.views[s.cur]
+}
+
+// loadView loads the current view and shows its rows.
+func (s *State) loadView() {
+	s.loadErr = s.currentView().load(s.ctx)
 	s.populateList()
 }
 
 func (s *State) populateList() {
-	s.header.SetText(fmtHeader())
+	v := s.currentView()
+	s.panel.SetTitle(" " + v.title() + " ")
+	s.header.SetText(v.header())
+	s.footer.SetText(fmtFooter(v))
 	s.list.Clear()
-	for _, in := range s.insts {
-		inst := in
-		s.list.AddItem(fmtInst(inst), "", 0, func() {
-			s.showActions(inst)
-		})
+	s.rowCount = 0
+	switch rows := v.rows(); {
+	case s.loadErr != nil:
+		s.list.AddItem("[red]"+tview.Escape("Error: "+s.loadErr.Error())+"[-]", "", 0, nil)
+	case len(rows) == 0:
+		s.list.AddItem(v.emptyText(), "", 0, nil)
+	default:
+		s.rowCount = len(rows)
+		for i, row := range rows {
+			s.list.AddItem(row, "", 0, func() {
+				v.selectRow(i)
+			})
+		}
 	}
-	if len(s.insts) > 0 {
-		s.list.SetCurrentItem(0)
-	}
+	s.list.SetCurrentItem(0)
 }
 
-const (
-	// rowFormat lays out the columns of a menu row: NAME, STATUS, ARCH, CPUS,
-	// MEMORY and VMTYPE. fmtHeader uses the same format, so that the column
-	// titles stay aligned with the values.
-	rowFormat = "%-16s  %-10s  %-8s  %-4s  %-8s  %s"
-
-	// statusIconWidth is the display width of the status icon plus the two
-	// spaces after it. The header is indented by the same amount.
-	statusIconWidth = 3
-)
-
-func fmtHeader() string {
-	return strings.Repeat(" ", statusIconWidth) +
-		fmt.Sprintf(rowFormat, "NAME", "STATUS", "ARCH", "CPUS", "MEMORY", "VMTYPE")
+// fmtFooter returns the footer: the keys of the view between the keys common to all the views.
+func fmtFooter(v view) string {
+	footer := " [::r]F1[::-] Help  "
+	if vf := v.footer(); vf != "" {
+		footer += vf + "  "
+	}
+	return footer + "[::r]F5[::-] Refresh  [::r]F9[::-] Menu  [::r]F10[::-] Quit"
 }
 
-func fmtInst(in *limatype.Instance) string {
-	icon := map[string]string{
-		"Running":    "[green]●[-]",
-		"Stopped":    "[red]●[-]",
-		"Broken":     "[yellow]●[-]",
-		"Installing": "[blue]◐[-]",
-	}[in.Status]
-	if icon == "" {
-		icon = "[gray]○[-]"
-	}
-
-	name := in.Name
-	if len(name) > 16 {
-		name = name[:13] + "..."
-	}
-
-	cpus := strconv.Itoa(in.CPUs)
-	memory := units.BytesSize(float64(in.Memory))
-
-	vmType := in.VMType
-	if vmType == "" {
-		vmType = "-"
-	}
-
-	prot := ""
-	if in.Protected {
-		prot = " " + tview.Escape("[PROTECTED]")
-	}
-
-	return fmt.Sprintf("%s  "+rowFormat+"%s", icon, name, in.Status, in.Arch, cpus, memory, vmType, prot)
-}
-
-func (s *State) currentInst() *limatype.Instance {
+// currentRow returns the index of the selected row of the current view, or -1 if no row is selected.
+func (s *State) currentRow() int {
 	idx := s.list.GetCurrentItem()
-	if idx >= 0 && idx < len(s.insts) {
-		return s.insts[idx]
+	if idx >= 0 && idx < s.rowCount {
+		return idx
 	}
-	return nil
+	return -1
+}
+
+// currentKey returns the key of the selected row of the current view, or "" if no row is selected.
+func (s *State) currentKey() string {
+	if row := s.currentRow(); row >= 0 {
+		return s.currentView().rowKey(row)
+	}
+	return ""
+}
+
+// selectKey selects the row with the given key in the current view
+// The selection is not changed if there is no such row.
+func (s *State) selectKey(key string) {
+	if key == "" {
+		return
+	}
+	v := s.currentView()
+	for i := range s.rowCount {
+		if v.rowKey(i) == key {
+			s.list.SetCurrentItem(i)
+			return
+		}
+	}
+}
+
+// switchView switches to the i-th view, restoring the row that was selected when leaving it.
+func (s *State) switchView(i int) {
+	if i < 0 || i >= len(s.views) || i == s.cur {
+		return
+	}
+	s.selected[s.cur] = s.currentKey()
+	s.cur = i
+	s.loadView()
+	s.selectKey(s.selected[i])
 }
 
 func (s *State) handleListInput(e *tcell.EventKey) *tcell.EventKey {
@@ -278,85 +304,50 @@ func (s *State) handleGlobalKey(e *tcell.EventKey) *tcell.EventKey {
 		return tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone)
 	case tcell.KeyCtrlP:
 		return tcell.NewEventKey(tcell.KeyUp, 0, tcell.ModNone)
+	case tcell.KeyF9:
+		if s.openedMenu >= 0 {
+			s.closeMenu()
+			return nil
+		}
 	}
 
-	// The shortcuts below are only for the instance list; other views
-	// (e.g., the input fields of the create form) receive the keys as is.
+	// The shortcuts below are only for the list; other screens
+	// (e.g., the input fields of the create form) receive the keys as is
 	if s.app.GetFocus() != s.list {
 		return e
 	}
 
+	if i := menuKey(s.menus(), e); i >= 0 {
+		s.openMenu(i)
+		return nil
+	}
+
 	switch {
+	case e.Key() == tcell.KeyF9:
+		s.openMenu(0)
+		return nil
 	case e.Key() == tcell.KeyF1, e.Rune() == 'h', e.Rune() == '?':
 		s.showHelp()
 		return nil
 	case e.Key() == tcell.KeyF5:
 		s.refreshList()
 		return nil
-	case e.Key() == tcell.KeyF7, e.Rune() == 'c', e.Rune() == 'C':
-		s.showCreateForm()
-		return nil
 	}
 
-	in := s.currentInst()
-	if in == nil {
-		return e
-	}
-
-	switch e.Key() {
-	case tcell.KeyF2:
-		s.toggleStartStop(in)
-		return nil
-	case tcell.KeyF3:
-		s.showInfo(in)
-		return nil
-	case tcell.KeyF8:
-		s.confirm(fmt.Sprintf("DELETE instance '%s'?\nThis cannot be undone.", in.Name), func() { s.execCmd("delete", in.Name) })
-		return nil
-	case tcell.KeyRune:
-		switch e.Rune() {
-		case 's':
-			s.execCmd("shell", in.Name)
-			return nil
-		case 'i', 'I':
-			s.showInfo(in)
-			return nil
-		case 'S':
-			s.toggleStartStop(in)
-			return nil
-		case 'r', 'R':
-			s.confirm(fmt.Sprintf("Confirm restart '%s'?", in.Name), func() { s.execCmd("restart", in.Name) })
-			return nil
-		case 'd', 'D':
-			s.confirm(fmt.Sprintf("DELETE instance '%s'?\nThis cannot be undone.", in.Name), func() { s.execCmd("delete", in.Name) })
-			return nil
-		}
-	}
-	return e
-}
-
-func (s *State) toggleStartStop(in *limatype.Instance) {
-	if in.Status == "Running" {
-		s.confirm(fmt.Sprintf("Confirm stop '%s'?", in.Name), func() { s.execCmd("stop", in.Name) })
-	} else {
-		s.execCmd("start", in.Name)
-	}
+	return s.currentView().handleKey(e, s.currentRow())
 }
 
 func (s *State) showHelp() {
 	help := `[green]Keybindings:[-]
 
   [green]F1[-] / [green]?[-] / [green]h[-]   Help (this screen)
-  [green]F2[-] / [green]S[-]       Start / Stop toggle
-  [green]F3[-] / [green]i[-]       Show instance info
-  [green]F5[-]           Refresh instance list
-  [green]F7[-] / [green]c[-]       Create a new instance
-  [green]F8[-] / [green]d[-]       Delete instance
-  [green]F10[-] / [green]q[-]      Quit
-
-  [green]Enter[-]        Open actions menu
-  [green]s[-]            Shell into instance
-  [green]r[-]            Restart instance`
+  [green]F5[-]           Refresh the list
+  [green]F9[-]           Open the menu bar (Left / Right: switch menus, Esc: close)
+  [green]Alt[-]+letter   Open a menu, e.g., Alt+V for View
+  [green]F10[-] / [green]q[-]      Quit`
+	if vh := s.currentView().help(); vh != "" {
+		help += fmt.Sprintf("\n\n[green]%s:[-]\n\n%s", s.currentView().title(), vh)
+	}
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
 		SetText(help)
@@ -368,16 +359,16 @@ func (s *State) showHelp() {
 	buttons.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
 		return formArrowKey(buttons, e)
 	})
-	view := tview.NewFlex().SetDirection(tview.FlexRow).
+	helpView := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(tv, 0, 1, false).
 		AddItem(buttons, 1, 0, true)
-	view.SetBorder(true).
+	helpView.SetBorder(true).
 		SetBorderColor(cBord).
 		SetTitle(" Help ").
 		SetTitleAlign(tview.AlignLeft).
 		SetTitleColor(cPrim).
 		SetBorderPadding(1, 1, 1, 1)
-	s.app.SetRoot(view, true).SetFocus(buttons)
+	s.app.SetRoot(helpView, true).SetFocus(buttons)
 }
 
 func (s *State) showUsage() {
@@ -389,108 +380,44 @@ func (s *State) showUsage() {
 	s.showTextView(" limactl --help ", tview.Escape(string(out)))
 }
 
+// refreshList reloads the current view, keeping the selected row.
 func (s *State) refreshList() {
-	insts, err := listInstances(s.ctx, s.limactl)
-	if err != nil {
-		logrus.Warnf("Failed to refresh: %v", err)
-		return
-	}
-	s.insts = insts
-	s.populateList()
+	key := s.currentKey()
+	s.loadView()
+	s.selectKey(key)
 }
 
-func (s *State) showActions(in *limatype.Instance) {
-	actions := []struct {
-		name string
-		fn   func()
-	}{
-		{"Shell", func() { s.execCmd("shell", in.Name) }},
-		{"Start / Stop Toggle", func() { s.toggleStartStop(in) }},
-		{"Restart", func() {
-			s.confirm(fmt.Sprintf("Confirm restart '%s'?", in.Name), func() { s.execCmd("restart", in.Name) })
-		}},
-		{"Show Info", func() { s.showInfo(in) }},
-		{"Show Ports", func() { s.showPorts(in) }},
-		{"Protect", func() { s.execCmd("protect", in.Name) }},
-		{"Unprotect", func() {
-			s.confirm(fmt.Sprintf("Confirm unprotect '%s'?", in.Name), func() { s.execCmd("unprotect", in.Name) })
-		}},
-		{"Delete", func() {
-			s.confirm(fmt.Sprintf("DELETE instance '%s'?\nThis cannot be undone.", in.Name), func() { s.execCmd("delete", in.Name) })
-		}},
-		{"Cancel", nil},
-	}
+// action is an item of the actions menu.
+type action struct {
+	name string
+	fn   func()
+}
 
+// showActions shows the actions menu with the given actions and a "Cancel" item.
+func (s *State) showActions(title string, actions []action) {
 	modal := tview.NewList().
 		SetSelectedStyle(tcell.StyleDefault.Reverse(true)).
 		SetHighlightFullLine(true).
 		SetMainTextColor(cTxt)
 	modal.SetBorder(true).
 		SetBorderColor(cBord).
-		SetTitle(fmt.Sprintf(" Actions for %s ", in.Name)).
+		SetTitle(title).
 		SetTitleAlign(tview.AlignLeft).
 		SetTitleColor(cSec).
 		SetBorderPadding(1, 1, 1, 1)
 	modal.SetInputCapture(s.handleListInput)
 
-	for _, a := range actions {
-		action := a
-		modal.AddItem("  "+action.name, "", 0, func() {
-			s.app.SetRoot(s.flex, true).SetFocus(s.list)
-			if action.fn != nil {
-				action.fn()
+	for _, a := range append(actions, action{"Cancel", nil}) {
+		modal.AddItem("  "+a.name, "", 0, func() {
+			s.backToList()
+			if a.fn != nil {
+				a.fn()
 			}
 		})
 	}
-	modal.SetDoneFunc(func() {
-		s.app.SetRoot(s.flex, true).SetFocus(s.list)
-	})
+	modal.SetDoneFunc(s.backToList)
 
 	s.app.SetRoot(modal, true).SetFocus(modal)
-}
-
-func (s *State) showInfo(in *limatype.Instance) {
-	prot := "No"
-	if in.Protected {
-		prot = "Yes"
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, `Status:       %s
-Hostname:     %s
-VM Type:      %s
-Architecture: %s
-CPUs:         %d
-Memory:       %s
-Disk:         %s
-SSH Port:     %d
-SSH Address:  %s
-Protected:    %s
-Lima Version: %s`, statusTag(in.Status), in.Hostname, in.VMType, in.Arch, in.CPUs, units.BytesSize(float64(in.Memory)), units.BytesSize(float64(in.Disk)), in.SSHLocalPort, in.SSHAddress, prot, in.LimaVersion)
-
-	if len(in.Errors) > 0 {
-		b.WriteString("\n\nErrors:\n")
-		for _, e := range in.Errors {
-			fmt.Fprintf(&b, "  - %s\n", e.Error())
-		}
-	}
-	if in.Message != "" {
-		fmt.Fprintf(&b, "\n\nMessage:\n  %s", in.Message)
-	}
-
-	s.showTextView(" Info ", b.String())
-}
-
-func (s *State) showPorts(in *limatype.Instance) {
-	out, err := exec.CommandContext(s.ctx, s.limactl, "list", "--format", `{{range .PortForwards}}{{.GuestIP}}:{{.GuestPort}} -> {{.HostIP}}:{{.HostPort}}{{"\n"}}{{end}}`, in.Name).CombinedOutput()
-	if err != nil {
-		s.showTextView(" Error ", "Failed to get ports: "+err.Error())
-		return
-	}
-	p := strings.TrimSpace(string(out))
-	if p == "" {
-		p = "No port forwards configured"
-	}
-	s.showTextView(" Port Forwards ", "Port Forwards for "+in.Name+"\n\n"+p)
 }
 
 func (s *State) showTextView(title, text string) {
@@ -511,7 +438,7 @@ func (s *State) showTextView(title, text string) {
 
 	tv.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
 		if e.Key() == tcell.KeyEscape || e.Rune() == 'q' || e.Rune() == 'Q' {
-			s.app.SetRoot(s.flex, true).SetFocus(s.list)
+			s.backToList()
 			return nil
 		}
 		return e
@@ -523,7 +450,7 @@ func (s *State) confirm(text string, onYes func()) {
 		SetText(text).
 		AddButtons([]string{"Yes", "No"}).
 		SetDoneFunc(func(i int, _ string) {
-			s.app.SetRoot(s.flex, true).SetFocus(s.list)
+			s.backToList()
 			if i == 0 {
 				onYes()
 			}
@@ -545,15 +472,16 @@ func styleModal(m *tview.Modal) {
 	m.SetButtonActivatedStyle(sActive)
 }
 
+// execCmd runs `limactl ACTION NAME`, and then selects the row with the given name.
 func (s *State) execCmd(action, name string) {
 	s.runSuspended(name, func() error {
 		return s.runLimactl(nil, action, name)
 	})
 }
 
-// runSuspended suspends the menu while running fn, and then refreshes the instance list
-// and selects the instance with the given name.
-func (s *State) runSuspended(name string, fn func() error) {
+// runSuspended suspends the menu while running fn, and then refreshes the current view
+// and selects the row with the given key.
+func (s *State) runSuspended(key string, fn func() error) {
 	suspend := s.app.Suspend(func() {
 		if err := fn(); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\nPress Enter to go back to the menu.\n", err)
@@ -566,7 +494,7 @@ func (s *State) runSuspended(name string, fn func() error) {
 		s.refreshList()
 	})
 
-	s.selectInstance(name)
+	s.selectKey(key)
 
 	if !suspend {
 		s.showTextView(" ERROR ", "Unable to suspend the menu")
@@ -585,75 +513,4 @@ func (s *State) runLimactl(stdin io.Reader, args ...string) error {
 		return fmt.Errorf("limactl %s failed: %w", strings.Join(args, " "), err)
 	}
 	return nil
-}
-
-func (s *State) selectInstance(name string) {
-	for i, inst := range s.insts {
-		if inst.Name == name {
-			s.list.SetCurrentItem(i)
-			return
-		}
-	}
-}
-
-func (s *State) showEmptyState() {
-	m := tview.NewModal().
-		SetText("No Lima instances found.").
-		AddButtons([]string{"Create Instance", "Quit"}).
-		SetDoneFunc(func(i int, _ string) {
-			if i == 0 {
-				s.showCreateForm()
-			} else {
-				s.app.Stop()
-			}
-		})
-	styleModal(m)
-	s.app.SetRoot(m, false).SetFocus(m)
-}
-
-func listInstances(ctx context.Context, limactl string) ([]*limatype.Instance, error) {
-	cmd := exec.CommandContext(ctx, limactl, "list", "--json")
-	// Buffer stderr rather than writing it to the terminal, so that warnings such as
-	// "No instance found. Run `limactl create` ..." do not reappear when the menu
-	// suspends the TUI to run another limactl command.
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	var res []*limatype.Instance
-	dec := json.NewDecoder(stdout)
-	for dec.More() {
-		var in limatype.Instance
-		if err := dec.Decode(&in); err != nil {
-			return nil, err
-		}
-		res = append(res, &in)
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("failed to run `limactl list --json`: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	slices.SortFunc(res, func(a, b *limatype.Instance) int {
-		if (a.Status == "Running") != (b.Status == "Running") {
-			if a.Status == "Running" {
-				return -1
-			}
-			return 1
-		}
-		return strings.Compare(a.Name, b.Name)
-	})
-	return res, nil
-}
-
-func statusTag(st string) string {
-	return map[string]string{
-		"Running":    "[green]RUNNING[-]",
-		"Stopped":    "[red]STOPPED[-]",
-		"Broken":     "[yellow]BROKEN[-]",
-		"Installing": "[blue]INSTALLING[-]",
-	}[st]
 }

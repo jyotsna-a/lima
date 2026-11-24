@@ -374,8 +374,8 @@ func limactlLines(ctx context.Context, limactl string, args ...string) ([]string
 }
 
 func (s *State) instNames() []string {
-	names := make([]string, len(s.insts))
-	for i, in := range s.insts {
+	names := make([]string, len(s.instances.insts))
+	for i, in := range s.instances.insts {
 		names[i] = in.Name
 	}
 	return names
